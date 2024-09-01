@@ -44,6 +44,20 @@ class test_worker_shutdown(SuiteOperations):
         assert_container_exited(worker)
         assert res.get(RESULT_TIMEOUT)
 
+    def test_multiple_warm_shutdown_does_nothing(self, celery_setup: CeleryTestSetup):
+        queue = celery_setup.worker.worker_queue
+        worker = celery_setup.worker
+        sig = long_running_task.si(5, verbose=True).set(queue=queue)
+        res = sig.delay()
+
+        worker.wait_for_log("Starting long running task")
+        for _ in range(3):
+            self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+        worker.wait_for_log(f"long_running_task[{res.id}] succeeded")
+
+        assert_container_exited(worker)
+        assert res.get(RESULT_TIMEOUT)
+
     def test_cold_shutdown(self, celery_setup: CeleryTestSetup):
         queue = celery_setup.worker.worker_queue
         worker = celery_setup.worker
@@ -109,6 +123,20 @@ class test_worker_shutdown(SuiteOperations):
 
             assert_container_exited(worker)
 
+        def test_hard_shutdown_from_cold(self, celery_setup: CeleryTestSetup):
+            queue = celery_setup.worker.worker_queue
+            worker = celery_setup.worker
+            sig = long_running_task.si(420, verbose=True).set(queue=queue)
+            sig.delay()
+
+            worker.wait_for_log("Starting long running task")
+            self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+            self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+
+            worker.wait_for_log("worker: Cold shutdown (MainProcess)", timeout=5)
+
+            assert_container_exited(worker)
+
     class test_worker_soft_shutdown_timeout(SuiteOperations):
         @pytest.fixture
         def default_worker_app(self, default_worker_app: Celery) -> Celery:
@@ -150,11 +178,51 @@ class test_worker_shutdown(SuiteOperations):
 
             assert_container_exited(worker)
 
+        class test_REMAP_SIGTERM(SuiteOperations):
+            @pytest.fixture
+            def default_worker_env(self, default_worker_env: dict) -> dict:
+                default_worker_env.update({"REMAP_SIGTERM": "SIGQUIT"})
+                return default_worker_env
+
+            def test_soft_shutdown(self, celery_setup: CeleryTestSetup):
+                app = celery_setup.app
+                queue = celery_setup.worker.worker_queue
+                worker = celery_setup.worker
+                sig = long_running_task.si(5, verbose=True).set(queue=queue)
+                res = sig.delay()
+
+                worker.wait_for_log("Starting long running task")
+                self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+                worker.wait_for_log(
+                    f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds",
+                )
+                worker.wait_for_log(f"long_running_task[{res.id}] succeeded")
+                worker.wait_for_log("worker: Cold shutdown (MainProcess)")
+
+                assert_container_exited(worker)
+                assert res.get(RESULT_TIMEOUT)
+
+            def test_hard_shutdown_from_soft(self, celery_setup: CeleryTestSetup):
+                queue = celery_setup.worker.worker_queue
+                worker = celery_setup.worker
+                sig = long_running_task.si(420, verbose=True).set(queue=queue)
+                sig.delay()
+
+                worker.wait_for_log("Starting long running task")
+                self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+                self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+                worker.wait_for_log("Waiting gracefully for cold shutdown to complete...")
+                worker.wait_for_log("worker: Cold shutdown (MainProcess)", timeout=5)
+                self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+
+                assert_container_exited(worker)
+
         class test_reset_visibility_timeout(SuiteOperations):
             @pytest.fixture
             def default_worker_app(self, default_worker_app: Celery) -> Celery:
                 app = default_worker_app
                 app.conf.prefetch_multiplier = 2
+                app.conf.worker_concurrency = 10
                 app.conf.broker_transport_options = {
                     "visibility_timeout": 3600,  # 1 hour
                     "polling_interval": 1,
@@ -235,3 +303,59 @@ class test_worker_shutdown(SuiteOperations):
                 assert res.get(RESULT_TIMEOUT) == [True, True]
                 assert short_task_res.get(RESULT_TIMEOUT)
                 assert long_task_res.get(RESULT_TIMEOUT)
+
+            class test_REMAP_SIGTERM(SuiteOperations):
+                @pytest.fixture
+                def default_worker_env(self, default_worker_env: dict) -> dict:
+                    default_worker_env.update({"REMAP_SIGTERM": "SIGQUIT"})
+                    return default_worker_env
+
+                def test_soft_shutdown_reset_visibility_timeout(self, celery_setup: CeleryTestSetup):
+                    if isinstance(celery_setup.broker, RabbitMQTestBroker):
+                        pytest.skip("RabbitMQ does not support visibility timeout")
+
+                    app = celery_setup.app
+                    queue = celery_setup.worker.worker_queue
+                    worker = celery_setup.worker
+                    sig = long_running_task.si(15, verbose=True).set(queue=queue)
+                    res = sig.delay()
+
+                    worker.wait_for_log("Starting long running task")
+                    self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+                    worker.wait_for_log(
+                        f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds"
+                    )
+                    worker.wait_for_log("worker: Cold shutdown (MainProcess)")
+                    worker.wait_for_log("Restoring 1 unacknowledged message(s)")
+                    assert_container_exited(worker)
+                    worker.restart()
+                    assert res.get(RESULT_TIMEOUT)
+
+                def test_soft_shutdown_reset_visibility_timeout_group_one_finish(
+                    self,
+                    celery_setup: CeleryTestSetup,
+                ):
+                    if isinstance(celery_setup.broker, RabbitMQTestBroker):
+                        pytest.skip("RabbitMQ does not support visibility timeout")
+
+                    app = celery_setup.app
+                    queue = celery_setup.worker.worker_queue
+                    worker = celery_setup.worker
+                    short_task = long_running_task.si(3, verbose=True).set(queue=queue)
+                    short_task_res = short_task.freeze()
+                    long_task = long_running_task.si(15, verbose=True).set(queue=queue)
+                    long_task_res = long_task.freeze()
+                    sig = group(short_task, long_task)
+                    sig.delay()
+
+                    worker.wait_for_log(f"long_running_task[{short_task_res.id}] received")
+                    worker.wait_for_log(f"long_running_task[{long_task_res.id}] received")
+                    self.kill_worker(worker, WorkerKill.Method.SIGTERM)
+                    worker.wait_for_log(
+                        f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds"
+                    )
+                    worker.wait_for_log(f"long_running_task[{short_task_res.id}] succeeded")
+                    worker.wait_for_log("worker: Cold shutdown (MainProcess)")
+                    worker.wait_for_log("Restoring 1 unacknowledged message(s)")
+                    assert_container_exited(worker)
+                    assert short_task_res.get(RESULT_TIMEOUT)
