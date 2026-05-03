@@ -62,7 +62,7 @@ def pytest_collection_modifyitems(config, items):
         if not item.path.name.startswith('test_'):
             continue
         content = item.path.read_text('utf-8')
-        if re.search(r'\bstart_worker\(', content):
+        if re.search(r'\bstart_worker\s*\(', content):
             pytest.exit(
                 f"\n{item.path.name} calls start_worker().\n"
                 f"Integration tests use the session-scoped worker from conftest.py.\n"
